@@ -1,21 +1,103 @@
 use extism_pdk::*;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::str::from_utf8;
+use serde_json::{json, Value};
+use std::{collections::HashMap, str::from_utf8};
 
-#[derive(Debug, Deserialize)]
-struct ChatMessage {
-    content: String,
+#[derive(Serialize)]
+struct WrappedTool {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: ToolFunction,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Serialize)]
+struct ToolFunction {
+    name: String,
+    description: String,
+    parameters: FunctionParameters,
+}
+
+#[derive(Serialize)]
+struct FunctionParameters {
+    #[serde(rename = "type")]
+    param_type: String,
+    properties: HashMap<String, serde_json::Value>,
+    required: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ToolResult {
+    id: String,
+    #[serde(rename = "type")]
+    type_: String,
+    function: ToolFunctionResult,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ToolFunctionResult {
+    name: String,
+    arguments: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChatMessage {
+    content: Option<String>,
+    role: String,
+    tool_calls: Option<Vec<ToolResult>>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct ChatChoice {
     message: ChatMessage,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct ChatResult {
     choices: Vec<ChatChoice>,
+}
+
+#[derive(Serialize, Deserialize, FromBytes)]
+#[encoding(Json)]
+pub struct InputSchema {
+    #[serde(rename = "type")]
+    pub data_type: String,
+    pub properties: HashMap<String, serde_json::Value>,
+    pub required: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, FromBytes)]
+#[encoding(Json)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Serialize, Deserialize, FromBytes)]
+#[encoding(Json)]
+pub struct Tool {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub input_schema: InputSchema,
+    #[serde(default = "default_type")]
+    pub r#type: String,
+}
+
+fn default_type() -> String {
+    "function".to_string()
+}
+
+#[derive(Serialize, Deserialize, FromBytes)]
+#[encoding(Json)]
+pub struct CompletionToolInput {
+    pub tools: Vec<Tool>,
+    pub messages: Vec<Message>,
 }
 
 #[derive(Debug)]
@@ -70,31 +152,61 @@ static MODELS: [Model; 8] = [
 fn get_completion(
     api_key: String,
     model: &Model,
-    input: String,
+    prompt: String,
     temperature: f32,
     role: String,
+    tools: Option<Vec<Tool>>,
 ) -> Result<ChatResult, anyhow::Error> {
     let req = HttpRequest::new("https://api.openai.com/v1/chat/completions")
         .with_header("Authorization", format!("Bearer {}", api_key))
         .with_header("Content-Type", "application/json")
         .with_method("POST");
 
+    let mut wrapped_tools: Vec<WrappedTool> = Vec::new();
+    match tools {
+        Some(tools) => {
+            info!("Tools found");
+            wrapped_tools = tools
+                .into_iter()
+                .map(|tool| WrappedTool {
+                    tool_type: "function".to_string(),
+                    function: ToolFunction {
+                        name: tool.name.unwrap_or_default(),
+                        description: tool.description.unwrap_or_default(),
+                        parameters: FunctionParameters {
+                            param_type: tool.input_schema.data_type,
+                            properties: tool.input_schema.properties,
+                            required: tool.input_schema.required,
+                        },
+                    },
+                })
+                .collect();
+        }
+        None => {
+            info!("No tools found");
+        }
+    }
+
     // We could make our own structs for the body
     // this is a quick way to make some unstructured JSON
-    let req_body = json!({
-      "model": model.name,
-      "temperature": temperature,
-      "messages": [
-        {
-            "role": "system",
-            "content": role,
-          },
-        {
-          "role": "user",
-          "content": input,
-        }
-      ],
+    let mut req_body = json!({
+        "model": model.name,
+        "temperature": temperature,
+        "messages": [
+            {
+                "role": "system",
+                "content": role,
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
     });
+
+    if !wrapped_tools.is_empty() {
+        req_body["tools"] = json!(wrapped_tools);
+    }
 
     let res = http::request::<String>(&req, Some(req_body.to_string()))?;
     match res.status_code() {
@@ -113,6 +225,7 @@ fn get_completion(
     }
     let response_body = res.body();
     let body = from_utf8(&response_body)?;
+
     let chat_result: ChatResult = serde_json::from_str(body)?;
     Ok(chat_result)
 }
@@ -209,9 +322,68 @@ fn get_config_values(
 pub fn completion(input: String) -> FnResult<String> {
     let cfg = get_config_values(|key| config::get(key))?;
 
-    let res = get_completion(cfg.api_key, &cfg.model, input, cfg.temperature, cfg.role)?;
+    let res = get_completion(
+        cfg.api_key,
+        &cfg.model,
+        input,
+        cfg.temperature,
+        cfg.role,
+        None,
+    )?;
 
-    Ok(res.choices[0].message.content.clone())
+    let output = res.choices[0].message.content.clone();
+
+    match output {
+        Some(output) => Ok(output),
+        None => Err(WithReturnCode::new(
+            anyhow::anyhow!("No completion returned"),
+            1,
+        )),
+    }
+}
+
+#[plugin_fn]
+pub fn completionWithTools(input: CompletionToolInput) -> FnResult<String> {
+    let cfg = get_config_values(|key| config::get(key))?;
+
+    let prompt = input.messages[0].content.clone();
+    let res = get_completion(
+        cfg.api_key,
+        &cfg.model,
+        prompt,
+        cfg.temperature,
+        cfg.role,
+        Some(input.tools),
+    )?;
+
+    let tool_calls = res.choices[0]
+        .message
+        .tool_calls
+        .as_ref()
+        .ok_or(anyhow::anyhow!("No tool calls found"))?;
+
+    let formatted_tool_calls: Vec<Value> = tool_calls
+        .iter()
+        .map(|tool_call| {
+            let mut tool_call_json = json!({
+                "name": tool_call.function.name,
+            });
+
+            if let Some(arguments_str) = &tool_call.function.arguments {
+                let arguments_json: Value = serde_json::from_str(arguments_str).unwrap();
+                tool_call_json["input"] = arguments_json;
+            }
+
+            tool_call_json
+        })
+        .collect();
+
+    let first_tool_call = formatted_tool_calls
+        .first()
+        .ok_or(anyhow::anyhow!("No tool calls found"));
+
+    let json_output = serde_json::to_string_pretty(&first_tool_call?)?;
+    Ok(json_output)
 }
 
 #[plugin_fn]
