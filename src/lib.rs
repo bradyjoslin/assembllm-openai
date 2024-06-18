@@ -378,11 +378,7 @@ pub fn completionWithTools(input: CompletionToolInput) -> FnResult<String> {
         })
         .collect();
 
-    let first_tool_call = formatted_tool_calls
-        .first()
-        .ok_or(anyhow::anyhow!("No tool calls found"));
-
-    let json_output = serde_json::to_string_pretty(&first_tool_call?)?;
+    let json_output = serde_json::to_string_pretty(&formatted_tool_calls)?;
     Ok(json_output)
 }
 
