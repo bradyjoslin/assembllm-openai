@@ -206,6 +206,7 @@ fn get_completion(
 
     if !wrapped_tools.is_empty() {
         req_body["tools"] = json!(wrapped_tools);
+        req_body["tool_choice"] = "required".into();
     }
 
     let res = http::request::<String>(&req, Some(req_body.to_string()))?;
